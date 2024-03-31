@@ -1,0 +1,557 @@
+
+/********************** CODE POUR CARTE LILYGO T-SIM 7600E *****************************/
+
+/********************************************************************************************
+            !!!!!!!!! VARIABLES A PARAMETRER A CHAQUE BOITIER !!!!!!!!!!!!!
+********************************************************************************************/
+const char apn[]  = "iot.1nce.net"; // APN de connexion pour carte SIM 1NCE
+const char gprsUser[] = ""; // Login vide
+const char gprsPass[] = ""; // Pass vide
+const String $id_boitier = "7600E-XXXX-XXX"; // ID unique du boitier
+//*******************************************************************************************
+
+#define TINY_GSM_MODEM_SIM7600
+// Set serial for debug console (to the Serial Monitor, default speed 115200)
+#define SerialMon Serial
+// Set serial for AT commands (to the module)
+// Use Hardware Serial on Mega, Leonardo, Micro
+#define SerialAT Serial1
+// See all AT commands, if wanted
+//#define DUMP_AT_COMMANDS 
+// Define the serial console for debug prints, if needed
+#define TINY_GSM_DEBUG SerialMon
+
+#define uS_TO_S_FACTOR      1000000ULL  /* Conversion factor for micro seconds to seconds */
+#define UART_BAUD           115200
+#define MODEM_TX            27
+#define MODEM_RX            26
+#define MODEM_PWRKEY        4
+#define MODEM_DTR           32
+#define MODEM_RI            33
+#define MODEM_FLIGHT        25
+#define MODEM_STATUS        34
+#define SD_MISO             2
+#define SD_MOSI             15
+#define SD_SCLK             14
+#define SD_CS               13
+#define LED_PIN             12
+#define ADC_PIN             35
+const char server[] = "connectbalance.mieldeventabren.fr";  
+const char resource[] = "/peser.php"; 
+const int  port = 80; // port de connexion, par défaut 80 ou 443
+RTC_DATA_ATTR float $SCALE = 28; //Sensibilité de la balance
+RTC_DATA_ATTR int $GPS_TIMEOUT = 15; //Mesure en nbre d'essai de mesures GPS (par défaut 15 à la mise sous tension)
+RTC_DATA_ATTR long $TIME_TO_SLEEP = 3600; //Mesure en secondes (par défaut toutes les heures à la mise sous tension)
+const int broche_DT = 39;
+const int broche_SCK = 18;
+
+// set GSM PIN, if any
+#define GSM_PIN             ""
+
+#include <TinyGsmClient.h>
+#include <esp_adc_cal.h>
+#include "HX711.h"
+
+HX711 balance; //objet balance
+
+#ifdef DUMP_AT_COMMANDS
+#include <StreamDebugger.h>
+StreamDebugger debugger(SerialAT, SerialMon);
+TinyGsm modem(debugger);
+#else
+TinyGsm modem(SerialAT);
+#endif
+
+int vref = 1100;
+RTC_DATA_ATTR long $bootcount;  
+RTC_DATA_ATTR long $offset;
+float mesurekg = 0;
+
+void setup()
+{
+  // Set console baud rate
+  SerialMon.begin(115200);
+  delay(10);
+
+  // Set GSM module baud rate
+  SerialAT.begin(UART_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
+
+  /*
+    The indicator light of the board can be controlled
+  */
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+  delay(200);
+  digitalWrite(LED_PIN, LOW);
+
+  /*
+    MODEM_PWRKEY IO:4 The power-on signal of the modulator must be given to it,
+    otherwise the modulator will not reply when the command is sent
+  */
+  pinMode(MODEM_PWRKEY, OUTPUT);
+  digitalWrite(MODEM_PWRKEY, HIGH);
+  delay(300); //Need delay
+  digitalWrite(MODEM_PWRKEY, LOW);
+  /*
+    MODEM_FLIGHT IO:25 Modulator flight mode control,
+    need to enable modulator, this pin must be set to high
+  */
+  pinMode(MODEM_FLIGHT, OUTPUT);
+  digitalWrite(MODEM_FLIGHT, HIGH);
+
+  // Initialisation de la balance
+  Serial.println("Initialisation de la balance...");
+  balance.begin(broche_DT, broche_SCK);
+  while (!balance.is_ready()) {
+    ;
+  }
+  balance.set_scale($SCALE); //le paramètre dépend des cellules de charge (voir variables).
+  //ajustement du poids zéro uniquement lors de la mise sous tension
+  if ($bootcount == 0) {
+    balance.tare(); 
+    $offset = balance.get_offset();
+    Serial.print("La balance est tarée et prete à fonctionner. Valeur de l'offset: ");
+    Serial.println($offset);
+    $bootcount++;
+  }
+  else {
+    balance.set_offset($offset);
+    Serial.print("Le poids 0 de la balance a ete defini lors de la mise sous tension. Valeur de l'offset en memoire: ");
+    Serial.println($offset);
+    $bootcount++;
+  }
+  
+
+}
+
+void light_sleep(uint32_t sec )
+{
+  esp_sleep_enable_timer_wakeup(sec * 1000000ULL);
+  esp_light_sleep_start();
+}
+
+void loop()
+{
+
+  //***************************************
+  //   CONNECTION DU MODEM AU RESEAU
+  //***************************************
+  bool res ;
+  // Restart takes quite some time
+  // To skip it, call init() instead of restart()
+  DBG("Initializing modem...");
+  if (!modem.init()) {
+    DBG("Failed to restart modem, delaying 10s and retrying");
+    return;
+  }
+  String ret;
+  ret = modem.setNetworkMode(2); // 2 – Automatic 13 – GSM Only 38 – LTE Only 51 – GSM+LTE Only
+  DBG("setNetworkMode:", ret);
+  uint8_t mode = modem.getGNSSMode();
+  DBG("GNSS Mode:", mode);
+
+  /**
+      CGNSSMODE: <gnss_mode>,<dpo_mode>
+      This command is used to configure GPS, GLONASS, BEIDOU and QZSS support mode.
+      gnss_mode:
+          0 : GLONASS
+          1 : BEIDOU
+          2 : GALILEO
+          3 : QZSS
+      dpo_mode :
+          0 disable
+          1 enable
+  */
+  modem.setGNSSMode(1, 1);
+  light_sleep(1);
+
+  /* Unlock your SIM card with a PIN if needed
+  if (GSM_PIN && modem.getSimStatus() != 3) {
+    modem.simUnlock(GSM_PIN);
+  }
+  */
+
+  Serial.println("Waiting for network...");
+  if (!modem.waitForNetwork(600000L)) {
+    light_sleep(10);
+    return;
+  }
+  if (modem.isNetworkConnected()) {
+    Serial.println("Network connected");
+  }
+
+  //***************************************
+  //        COLLECTE DU POIDS
+  //***************************************
+  
+  float $poids=0; 
+  int $x=0;
+  Serial.print("Valeur du scale: ");
+  Serial.println($SCALE);
+  //Enregistre la moyenne de 10 pesées
+  while ($x <= 10) {
+    $x++;
+    $poids += abs(balance.get_units(10)/1000); //unités en kg
+    Serial.print("Poids moyen mesuré sur la balance: ");
+    Serial.println($poids/$x);
+    delay(1000);
+  }
+  $poids = abs($poids/$x); // moyenne des poids mesurés
+  Serial.print("Poids moyen retenu: ");
+  Serial.println($poids);
+  
+  //***************************************
+  //    COLLECTE DU NIVEAU DE BATTERIE
+  //***************************************
+  Serial.println("\n---Mesure de la tension de la batterie---\n");
+  esp_adc_cal_characteristics_t adc_chars;
+  esp_adc_cal_value_t val_type = esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);    //Check type of calibration value used to characterize ADC
+  if (val_type == ESP_ADC_CAL_VAL_EFUSE_VREF) {
+      Serial.printf("eFuse Vref:%u mV\n", adc_chars.vref);
+      vref = adc_chars.vref;
+  } else if (val_type == ESP_ADC_CAL_VAL_EFUSE_TP) {
+      Serial.printf("Two Point --> coeff_a:%umV coeff_b:%umV\n", adc_chars.coeff_a, adc_chars.coeff_b);
+  } else {
+      Serial.println("Default Vref: 1100mV");
+  }
+  uint16_t $v = analogRead(ADC_PIN);
+  float $batt = ((float)$v / 4095.0) * 2.0 * 3.3 * (vref / 1000.0);
+  String voltage = "Voltage :" + String($batt) + "V\n";
+  Serial.println(voltage);
+  if ($batt == 0.00) Serial.println("Cable USB connecté. La tension retenue est de 0.00V. Déconnecter le cable.");
+
+  //***************************************
+  //    COLLECTE DE la TEMPERATURE
+  //***************************************
+  Serial.println("\n---Mesure de la temperature du chip interne---\n");
+  int $i = 0;
+  float $temp = 0;
+  
+  while (($temp == 0 or $temp > 200) && $i < 20) { //on lit la température 20 fois tant que la mesure ne fonctionne pas
+    $i++;
+    $temp = modem.getTemperature();
+    delay(200);
+  }
+  if ($temp > 200) {
+    $temp = 0;
+  }
+  Serial.print("Chip temperature: ");
+  Serial.println($temp);
+
+  //***************************************
+  //    COLLECTE DES DONNEES GPS
+  //***************************************
+  String $lat = "0";
+  String $lon = "0";
+  Serial.println("\n--- Démarrage de l'acquisition GPS ---\n");
+  if ($GPS_TIMEOUT > 0) { //Ne capture pas la GPS quand la mesure de GPS_TIMEOUT est de 1
+    float NombreFloat = (float) $bootcount/$GPS_TIMEOUT; 
+    int NombreInt = round($bootcount/$GPS_TIMEOUT);
+    Serial.print("Bootcounts: ");
+    Serial.println($bootcount);
+    Serial.print("Multiple de bootcounts / GPS (float): ");
+    Serial.println(NombreFloat);
+    Serial.print("Multiple de bootcounts / GPS (int): ");
+    Serial.println(NombreInt);
+    if ((NombreInt == NombreFloat) or ($bootcount == 1)) { // ne capture le GPS que lorsque le boot est un multiple de GPS_TIMEOUT
+      DBG("Enabling GPS/GNSS/GLONASS");
+      modem.enableGPS();
+      light_sleep(2);
+
+      float lat2      = 0;
+      float lon2      = 0;
+      float speed2    = 0;
+      float alt2      = 0;
+      int   vsat2     = 0;
+      int   usat2     = 0;
+      float accuracy2 = 0;
+      int   year2     = 0;
+      int   month2    = 0;
+      int   day2      = 0;
+      int   hour2     = 0;
+      int   min2      = 0;
+      int   sec2      = 0;
+      DBG("Requesting current GPS/GNSS/GLONASS location");
+      for (int8_t i = 10; i; i--) {
+      //for (;;) {
+        //digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+        Serial.print("Essai n°");
+        Serial.println(i);
+        if (modem.getGPS(&lat2, &lon2, &speed2, &alt2, &vsat2, &usat2, &accuracy2,
+                        &year2, &month2, &day2, &hour2, &min2, &sec2)) {
+          DBG("Latitude:", String(lat2, 8), "\tLongitude:", String(lon2, 8));
+          DBG("Speed:", speed2, "\tAltitude:", alt2);
+          DBG("Visible Satellites:", vsat2, "\tUsed Satellites:", usat2);
+          DBG("Accuracy:", accuracy2);
+          DBG("Year:", year2, "\tMonth:", month2, "\tDay:", day2);
+          DBG("Hour:", hour2, "\tMinute:", min2, "\tSecond:", sec2);
+          break;
+        } else {
+          Serial.println(" Echec: mode sleep pour 10 sec avant nouvel essai");
+          light_sleep(10);
+        }
+      }
+      DBG("Retrieving GPS/GNSS/GLONASS location again as a string");
+      String gps_raw = modem.getGPSraw();
+      Serial.print("GPS/GNSS Based Location String: ");
+      Serial.println(gps_raw);
+      DBG("Disabling GPS");
+      modem.disableGPS();
+      if (lat2 != 0) $lat = String(lat2, 8);
+      if (lon2 != 0) $lon = String(lon2, 8);
+    }
+  }
+  Serial.println("\n--- Fin de l'acquisition GPS ---\n");
+
+  //*************************************************
+  //   COMMUNICATION VERS LE SERVEUR MIELCONNECT
+  //*************************************************
+
+  TinyGsmClient client(modem, 0);
+  Serial.println("\n--- Connection GPRS au Serveur MielConnect ---\n");
+  Serial.println("Connecting to: " + String(apn));
+  if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
+      delay(10000);
+      return;
+  }
+  Serial.print("GPRS status: ");
+  if (modem.isGprsConnected()) {
+      Serial.println("connected");
+  } else {
+      Serial.println("not connected");
+  }
+  Serial.print("Connecting to ");
+  Serial.print(server);
+  if (!client.connect(server, port)) {
+    Serial.println(" fail");
+  }
+  else {
+    Serial.println(" OK");
+    // COLLECTE DE LA QUALITE DU SIGNAL RESEAU
+    int16_t $db =  modem.getSignalQuality();
+
+    // PUBLICATION DES DONNEES SUR LE SERVEUR MIELCONNECT
+    String httpRequestData = "ID=" + $id_boitier + "&POIDS=" + String($poids) + "&GPS_LON=" + String($lon) + "&GPS_LAT=" + String($lat) + "&BATT=" + String($batt) + "&DB=" + String($db) + "&TEMP=" + String($temp);
+    Serial.print("Performing HTTP POST request: ");
+    Serial.println (httpRequestData);
+    client.print(String("POST ") + resource + " HTTP/1.1\r\n");
+    client.print(String("Host: ") + server + "\r\n");
+    client.println("Connection: close");
+    client.println("Content-Type: application/x-www-form-urlencoded");
+    client.print("Content-Length: ");
+    client.println(httpRequestData.length());
+    client.println();
+    client.println(httpRequestData);
+
+    // Wait for data to arrive
+    uint32_t start = millis();
+    while (client.connected() && !client.available() &&
+           millis() - start < 60000L) {
+      delay(100);
+    };
+    // Read data
+    start = millis();
+    String $httpResponse;
+    while (client.connected() && millis() - start < 10000L) {
+      while (client.available()) {
+        char c = client.read();
+        $httpResponse = $httpResponse + c;
+        start = millis();
+      }
+    }
+    
+    Serial.println($httpResponse);
+    String $tts = $httpResponse.substring($httpResponse.indexOf("&")+1,$httpResponse.indexOf("#")); //Extrait du retour du fichier peser.php du caractère "&" à "#"
+    Serial.print("Update_interval envoyé par le serveur: ");
+    Serial.println($tts);
+    if ($tts.toInt() > 60) {
+      $TIME_TO_SLEEP = $tts.toInt(); // Met à jour l'intervalle d'update d'après le retour http MielConnect
+      Serial.print("Updated Time to Sleep : ");
+      Serial.println($TIME_TO_SLEEP);
+    }
+    else Serial.println("Le Time to Sleep est trop faible, aucune mise à jour effectuée (doit etre > 60 secondes)");
+
+    String $scale_param = $httpResponse.substring($httpResponse.indexOf("#")+1,$httpResponse.indexOf("~")); //Extrait du retour du fichier peser.php du caractère "#" à "~"
+    if ($scale_param.toFloat() >= 1) {
+      $SCALE = $scale_param.toFloat();
+      Serial.print("Scale balance enregistré depuis le serveur: ");
+      Serial.println($SCALE);
+    }
+    else {
+      Serial.print("Scale balance n'a pas pu etre enregistré depuis le serveur, valeur conservée: ");
+      Serial.println($SCALE);
+    } 
+
+    String $gpsto = $httpResponse.substring($httpResponse.indexOf("~")+1,$httpResponse.indexOf("^")); //Extrait du retour du fichier peser.php du caractère "~" à "^"
+    if ($gpsto.toInt() >= 0) {
+      $GPS_TIMEOUT = $gpsto.toInt();
+      Serial.print("GPS Timeout enregistré depuis le serveur: ");
+      Serial.println($GPS_TIMEOUT);
+    }
+    else {
+      Serial.print("Itérations GPS n'a pas pu etre enregistré depuis le serveur, valeur conservée: ");
+      Serial.println($GPS_TIMEOUT);
+    } 
+
+    String $beekubeAPIkey = "";
+    $beekubeAPIkey = $httpResponse.substring($httpResponse.indexOf("^")+1,$httpResponse.indexOf("%")); //Extrait du retour du fichier peser.php du caractère "^" à "%"
+    if ($beekubeAPIkey != "") {
+      Serial.print("APIkey Beekube récupéré depuis le serveur : ");
+      Serial.println($beekubeAPIkey);
+    }
+    else {
+      Serial.println("Pas d'APIkey Beekube paramétrée");
+    } 
+
+    String $beekubeID = "";
+    $beekubeID = $httpResponse.substring($httpResponse.indexOf("%")+1,$httpResponse.indexOf("*")); //Extrait du retour du fichier peser.php du caractère "%" à "*"
+    if ($beekubeID != "") {
+      Serial.print("Identification Beekube récupéré depuis le serveur : ");
+      Serial.println($beekubeID);
+    }
+    else {
+      Serial.println("Pas d'identifiant Beekube paramétré");
+    } 
+
+    String $dateserver = "";
+    $dateserver = $httpResponse.substring($httpResponse.indexOf("*")+1,$httpResponse.indexOf("ç")); //Extrait du retour du fichier peser.php du caractère "*" à "ç"
+    if ($dateserver != "") {
+      Serial.print("Date récupérée depuis le serveur : ");
+      Serial.println($dateserver);
+    }
+    else {
+      Serial.println("Impossible de récupérer la date du serveur");
+    } 
+    client.stop();
+
+    if ($beekubeAPIkey !="" && $beekubeID !="") {
+      //Connexion au serveur Beekube 
+      Serial.print("Connecting to ");
+      Serial.print("www.beekube.com");
+    
+      //if (!client.connect("www.beekube.com", 443)) {
+      if (!client.connect("www.beekube.com", 80)) {  
+        Serial.println(" fail");
+      }
+      else {
+        Serial.println(" OK");
+        // Making an HTTP POST request
+        Serial.println("Performing HTTP POST request on Beekube.com...");
+        // Prepare your HTTP POST request data
+        float $dbpourcent = $db*100 / 35;
+        if ($dbpourcent > 100) { 
+          $dbpourcent = 100;
+        }
+        httpRequestData = "[";
+        httpRequestData += "{\"date\":\"" + String($dateserver) + "\",\"value\":\"" + String($poids) + "\",\"unit\":\"kilogram\",\"type\":\"weight\"}";
+        httpRequestData += ",{\"date\":\"" + String($dateserver) + "\",\"value\":\"" + String($batt) + "\",\"unit\":\"volt\",\"type\":\"device_battery\"}";
+        httpRequestData += ",{\"date\":\"" + String($dateserver) + "\",\"value\":\"" + String($dbpourcent) + "\",\"unit\":\"pourcentage\",\"type\":\"device_signal\"}";
+        httpRequestData += ",{\"date\":\"" + String($dateserver) + "\",\"value\":\"" + String($temp) + "\",\"unit\":\"degres\",\"type\":\"temp_int\"}";
+        httpRequestData += "]";
+        Serial.println(httpRequestData);
+
+        client.print(String("POST ") + "/api/v1/device/" + String($beekubeID) + "/data" + " HTTP/1.1\r\n");
+        client.print(String("Host: ") + "www.beekube.com" + "\r\n");
+        client.println("Connection: close");
+        client.println("Content-Type: application/json");
+        client.println("Accept: application/json");
+        client.println("X-API-KEY: " + String($beekubeAPIkey));
+        client.println("User-Agent: TinyGSM/LilyGo-A7670E");
+        client.print("Content-Length: ");
+        client.println(httpRequestData.length());
+        client.println();
+        client.println(httpRequestData);
+        // Wait for data to arrive
+        uint32_t start = millis();
+        while (client.connected() && !client.available() &&
+              millis() - start < 60000L) {
+          delay(100);
+        };
+        // Read data
+        start = millis();
+        String $httpResponse;
+        while (client.connected() && millis() - start < 10000L) {
+          while (client.available()) {
+            char c = client.read();
+            $httpResponse = $httpResponse + c;
+            start = millis();
+          }
+        }
+        Serial.println($httpResponse);
+        client.stop();
+
+        /*
+        // ENVOI DES COORDONNEES GPS SUR BEEKUBE
+
+        if (!client.connect("www.beekube.com", 80)) {  
+        Serial.println(" fail");
+        }
+        else {
+          Serial.println(" OK");
+          // Making an HTTP POST request
+          Serial.println("Performing HTTP POST request on Beekube.com...");
+          //Mise à jour de la position GPS si donnée disponible
+          $lat = "43.54466248";
+          $lon = "5.30666924";
+          if (String($lat) != "0" && String($lon) != "0") {
+          // "ID=" + $id_boitier + "&POIDS=" + String($poids) + "&GPS_LON=" + String($lon) + "&GPS_LAT=" + String($lat) + "&BATT=" + String($batt) + "&DB=" + String($db) + "&TEMP=" + String($temp);
+            httpRequestData = "{\"typeConnection\":\"3\",\"statusConnection\":\"0\",\"refExtern\":\"position GPS\",\"state\":0,\"lat\":" + String($lat) + ",\"lng\":" + String($lon) + "}";
+            Serial.println(httpRequestData);
+            client.print(String("POST ") + "/api/v1/device/" + String($beekubeID) + "/update" + " HTTP/1.1\r\n");
+            client.print(String("Host: ") + "www.beekube.com" + "\r\n");
+            client.println("Connection: close");
+            client.println("Content-Type: application/json");
+            client.println("Accept: application/json");
+            client.println("X-API-KEY: " + String($beekubeAPIkey));
+            client.println("User-Agent: TinyGSM/LilyGo-A7670E");
+            client.print("Content-Length: ");
+            client.println(httpRequestData.length());
+            client.println();
+            client.println(httpRequestData);
+            // Wait for data to arrive
+            uint32_t start = millis();
+            while (client.connected() && !client.available() &&
+                  millis() - start < 60000L) {
+              delay(100);
+            };
+            // Read data
+            start = millis();
+            String $httpResponse;
+            while (client.connected() && millis() - start < 10000L) {
+              while (client.available()) {
+                char c = client.read();
+                $httpResponse = $httpResponse + c;
+                start = millis();
+              }
+            }
+            Serial.println($httpResponse);
+          
+          }
+        }
+        */
+      }
+    }
+    // Close client and disconnect
+    client.stop();
+    Serial.println(F("Server disconnected"));
+  }
+  Serial.println("\n---End of GPRS COMMUNICATION---\n");
+  modem.gprsDisconnect();
+  light_sleep(5);
+  if (!modem.isGprsConnected()) {
+    DBG("GPRS disconnected");
+  } else {
+    DBG("GPRS disconnect: Failed.");
+  }
+
+  // Try to power-off (modem may decide to restart automatically)
+  // To turn off modem completely, please use Reset/Enable pins
+  modem.poweroff();
+  Serial.println("Passage en hibernation pour " + String($TIME_TO_SLEEP/60) + " minutes.");
+    // Wait for modem to power off
+  light_sleep(5);
+  esp_sleep_enable_timer_wakeup($TIME_TO_SLEEP * uS_TO_S_FACTOR);
+  delay(200);
+  esp_deep_sleep_start();
+
+}
